@@ -16,6 +16,7 @@ Usage:
     glide.py --selftest                     # run the built-in checks
 """
 import argparse
+import atexit
 import ctypes
 import json
 import socket
@@ -24,7 +25,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 DEFAULT_PORT = 24800
 
 # ---------------------------------------------------------------------------
@@ -170,16 +171,27 @@ class Controller:
         # produces a fresh delta we can forward (works on any monitor layout).
         self.user32.SetCursorPos(self.cx, self.cy)
 
-    # -- control handoff (Scroll Lock) -------------------------------------
+    def set_block(self, on):
+        # Hard OS-level freeze of local mouse+keyboard while the other PC is
+        # driven (ShareMouse does this too). Low-level hooks still fire under
+        # BlockInput, so Ctrl+Alt+G still releases; Ctrl+Alt+Del always escapes.
+        try:
+            self.user32.BlockInput(1 if on else 0)
+        except Exception:
+            pass
+
+    # -- control handoff (Ctrl+Alt+G) --------------------------------------
     def grab(self):
         self.active = True
-        self.warp_center()
+        self.set_block(True)                 # freeze local input...
+        self.warp_center()                   # ...and park the cursor at center
         print(">>> NOW CONTROLLING THE OTHER PC   (Ctrl+Alt+G to come back)")
 
     def release(self):
         if not self.active:
             return
         self.active = False
+        self.set_block(False)                # ALWAYS unfreeze local input first
         for vk in list(self._mods):          # don't leave Ctrl/Alt stuck on the remote
             self.send({"t": "key", "vk": vk, "p": False})
         print("<<< BACK ON THIS PC                (Ctrl+Alt+G to switch again)")
@@ -258,6 +270,8 @@ class Controller:
 
         self._ml = mouse.Listener(win32_event_filter=mouse_wf, suppress=False)
         self._kl = keyboard.Listener(win32_event_filter=key_wf, suppress=False)
+        # Failsafe: whatever happens, never leave the OS input frozen.
+        atexit.register(lambda: self.user32.BlockInput(0))
         self._ml.start()
         self._kl.start()
         try:
@@ -266,6 +280,7 @@ class Controller:
         except KeyboardInterrupt:
             pass
         finally:
+            self.set_block(False)            # guaranteed unfreeze on any exit
             self._ml.stop()
             self._kl.stop()
 
@@ -311,6 +326,7 @@ def controller_logic_test():
 
     c = Controller("127.0.0.1", DEFAULT_PORT)
     c.warp_center = lambda: None          # do NOT move the real cursor
+    c.set_block = lambda on: None         # do NOT freeze the real input
     c.sent = []
     c.send = c.sent.append
     mf, kf = c.mouse_filter(), c.key_filter()

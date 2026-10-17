@@ -21,13 +21,14 @@ import argparse
 import atexit
 import ctypes
 import json
+import queue
 import socket
 import struct
 import sys
 import threading
 import time
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 DEFAULT_PORT = 24800
 
 # ---------------------------------------------------------------------------
@@ -110,6 +111,7 @@ def run_receiver(port: int):
     print("Waiting for a controller to connect... (Ctrl+C to quit)")
     while True:
         conn, addr = srv.accept()
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # low-latency inject
         print(f"Controller connected from {addr[0]}. Control is live.")
         try:
             for msg in iter_messages(conn):
@@ -181,6 +183,7 @@ class Controller:
         self._cross = 0              # travel past the crossing edge while active
         self._mods = set()           # Ctrl/Alt keys currently held down
         self._ml = self._kl = None   # listeners, set in run()
+        self._q = queue.Queue()      # outbound events; drained by a sender thread
 
     # -- screen-edge geometry ----------------------------------------------
     def _at_edge(self, x, y):
@@ -210,13 +213,48 @@ class Controller:
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.host, self.port))
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # no Nagle lag
+        threading.Thread(target=self._sender_loop, daemon=True).start()
 
     def send(self, msg: dict):
-        try:
-            self.sock.sendall(encode(msg))
-        except OSError as e:
-            print(f"Send failed ({e}); control back on THIS PC.")
-            self.release()
+        # Called from the hook thread: just enqueue so capture never blocks on
+        # the network. The sender thread does the actual socket write.
+        self._q.put(msg)
+
+    def _sender_loop(self):
+        while True:
+            msg = self._q.get()
+            if msg is None:
+                return
+            batch = [msg]
+            try:
+                while True:
+                    batch.append(self._q.get_nowait())
+            except queue.Empty:
+                pass
+            stop = None in batch
+            for m in self._coalesce(x for x in batch if x is not None):
+                try:
+                    self.sock.sendall(encode(m))
+                except OSError as e:
+                    print(f"Send failed ({e}); control back on THIS PC.")
+                    self.release()
+                    return
+            if stop:
+                return
+
+    @staticmethod
+    def _coalesce(msgs):
+        # Merge consecutive mouse-moves into one (sum deltas) to catch up
+        # smoothly under load instead of replaying a backlog of tiny jumps.
+        out = []
+        for m in msgs:
+            if m.get("t") == "mv" and out and out[-1]["t"] == "mv":
+                out[-1] = {"t": "mv", "dx": out[-1]["dx"] + m["dx"],
+                           "dy": out[-1]["dy"] + m["dy"]}
+            else:
+                out.append(m)
+        return out
 
     def warp_center(self):
         # Keep the real cursor pinned to screen center so every physical move
@@ -348,6 +386,7 @@ class Controller:
             pass
         finally:
             self.set_block(False)            # guaranteed unfreeze on any exit
+            self._q.put(None)                # stop the sender thread
             self._ml.stop()
             self._kl.stop()
 
@@ -427,7 +466,15 @@ def controller_logic_test():
     assert mf(WM_MOUSEMOVE, MData(c.vR, c.cy)) is False
     assert c.active is True
 
-    print("controller logic OK: edge-cross, switch, move, click, key, back all correct.")
+    # consecutive mouse-moves coalesce; clicks break the run and keep order
+    merged = Controller._coalesce([
+        {"t": "mv", "dx": 1, "dy": 2}, {"t": "mv", "dx": 3, "dy": -1},
+        {"t": "btn", "b": "left", "p": True}, {"t": "mv", "dx": 5, "dy": 5}])
+    assert merged == [{"t": "mv", "dx": 4, "dy": 1},
+                      {"t": "btn", "b": "left", "p": True},
+                      {"t": "mv", "dx": 5, "dy": 5}]
+
+    print("controller logic OK: edge-cross, switch, move, click, key, coalesce all OK.")
 
 
 def selftest():

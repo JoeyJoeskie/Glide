@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 DEFAULT_PORT = 24800
 
 # ---------------------------------------------------------------------------
@@ -143,6 +143,23 @@ BTN_DOWN = {WM_LBUTTONDOWN: "left", WM_RBUTTONDOWN: "right", WM_MBUTTONDOWN: "mi
 BTN_UP = {WM_LBUTTONUP: "left", WM_RBUTTONUP: "right", WM_MBUTTONUP: "middle"}
 
 
+def enable_dpi_awareness():
+    # Make screen metrics, SetCursorPos and the low-level hook all agree on
+    # PHYSICAL pixels. Without this, on a scaled/high-DPI display the hook
+    # reports a different coordinate scale than GetSystemMetrics, so warp-to-
+    # center never lines up and every move becomes a huge bogus delta.
+    for attempt in (
+        lambda: ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)),
+        lambda: ctypes.windll.shcore.SetProcessDpiAwareness(2),
+        lambda: ctypes.windll.user32.SetProcessDPIAware(),
+    ):
+        try:
+            if attempt():
+                return
+        except Exception:
+            continue
+
+
 class Controller:
     def __init__(self, host, port, edge="right"):
         self.host = host
@@ -150,6 +167,7 @@ class Controller:
         self.edge = edge             # which outer screen edge crosses to the other PC
         self.sock = None
         self.active = False          # True = input is being forwarded
+        enable_dpi_awareness()       # MUST run before reading metrics below
         self.user32 = ctypes.windll.user32
         # Use the WHOLE virtual desktop (all monitors), so "right edge" is the
         # true outer edge of the rightmost monitor - not a seam between monitors.

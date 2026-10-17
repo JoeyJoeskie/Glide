@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 DEFAULT_PORT = 24800
 
 # ---------------------------------------------------------------------------
@@ -100,7 +100,7 @@ def virtual_box(user32):
 # Receiver: announce its screen box, then inject whatever the controller sends.
 # ---------------------------------------------------------------------------
 
-def run_receiver(port: int):
+def run_receiver(port: int, code: str = ""):
     from pynput import mouse, keyboard
 
     enable_dpi_awareness()
@@ -144,10 +144,17 @@ def run_receiver(port: int):
     while True:
         conn, addr = srv.accept()
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # low-latency inject
+        gen = iter_messages(conn)
         try:
+            first = next(gen, None)          # controller must authenticate first
+            if not first or first.get("t") != "auth" or str(first.get("code", "")) != str(code):
+                conn.sendall(encode({"t": "denied"}))
+                print(f"Rejected {addr[0]}: wrong or missing password.")
+                conn.close()
+                continue
             conn.sendall(encode({"t": "hello", "x0": x0, "y0": y0, "w": w, "h": h}))
             print(f"Controller connected from {addr[0]}. Control is live.")
-            for msg in iter_messages(conn):
+            for msg in gen:
                 handle(msg)
         except (ConnectionResetError, OSError, json.JSONDecodeError) as e:
             print(f"Connection dropped: {e}")
@@ -181,10 +188,11 @@ def _clamp(v, lo, hi):
 
 
 class Controller:
-    def __init__(self, host, port, edge="right"):
+    def __init__(self, host, port, edge="right", code=""):
         self.host = host
         self.port = port
         self.edge = edge
+        self.code = code
         self.sock = None
         self.active = False
         enable_dpi_awareness()
@@ -204,21 +212,26 @@ class Controller:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.host, self.port))
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self._read_hello()
+        self.sock.sendall(encode({"t": "auth", "code": self.code}))   # authenticate first
+        self._handshake()
         threading.Thread(target=self._sender_loop, daemon=True).start()
 
-    def _read_hello(self):
-        # The receiver announces its screen box first. Tolerate an old receiver.
-        self.sock.settimeout(4)
+    def _handshake(self):
+        # Expect the receiver's screen box, or a refusal if the password is wrong.
+        self.sock.settimeout(5)
         try:
-            msg = next(iter_messages(self.sock))
-            if msg.get("t") == "hello":
-                self.rx0, self.ry0 = msg["x0"], msg["y0"]
-                self.rw, self.rh = msg["w"], msg["h"]
-        except (StopIteration, OSError, json.JSONDecodeError):
-            print("No hello from receiver (old version?); assuming same screen size.")
+            msg = next(iter_messages(self.sock), None)
+        except (OSError, json.JSONDecodeError):
+            msg = None
         finally:
             self.sock.settimeout(None)
+        if msg and msg.get("t") == "denied":
+            raise PermissionError("receiver refused the password")
+        if msg and msg.get("t") == "hello":
+            self.rx0, self.ry0 = msg["x0"], msg["y0"]
+            self.rw, self.rh = msg["w"], msg["h"]
+        else:
+            print("No hello from receiver (old version?); assuming same screen size.")
 
     def send(self, msg: dict):
         self._q.put(msg)             # enqueue only; sender thread does the write
@@ -522,6 +535,7 @@ def main():
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--edge", default="right", choices=["left", "right", "top", "bottom"],
                    help="screen edge that glides to the other PC (default: right)")
+    p.add_argument("--code", default="", help="connection password (shared on both PCs)")
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args()
 
@@ -539,8 +553,9 @@ def main():
         sys.exit(1)
 
     if args.role == "receiver":
+        code = args.code or input("Set a connection password (the other PC must enter it): ").strip()
         try:
-            run_receiver(args.port)
+            run_receiver(args.port, code)
         except KeyboardInterrupt:
             print("\nBye.")
     else:
@@ -548,8 +563,12 @@ def main():
         if not host:
             print("No receiver IP given.")
             sys.exit(1)
+        code = args.code or input("Receiver's password: ").strip()
         try:
-            Controller(host, args.port, args.edge).run()
+            Controller(host, args.port, args.edge, code).run()
+        except PermissionError:
+            print("Receiver refused the connection: wrong password.")
+            sys.exit(1)
         except (ConnectionRefusedError, OSError) as e:
             print(f"Could not reach receiver {host}:{args.port} -> {e}")
             print("Is the receiver running and the port open in the firewall?")

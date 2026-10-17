@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 DEFAULT_PORT = 24800
 
 # ---------------------------------------------------------------------------
@@ -318,14 +318,20 @@ class Controller:
             self.enter(self.rw // 2, self.rh // 2)   # hotkey entry: remote center
 
     def _park_inside_edge(self):
+        # Return to this screen at the SAME relative spot the remote cursor had,
+        # mapped across the two screens' sizes (so it doesn't snap to center).
         e = self.edge
+        py = int(self.vT + (self.ry / max(1, self.rh - 1)) * self.vH)
+        px = int(self.vL + (self.rx / max(1, self.rw - 1)) * self.vW)
+        py = _clamp(py, self.vT + 2, self.vB - 2)
+        px = _clamp(px, self.vL + 2, self.vR - 2)
         if e == "right":
-            return (self.vR - 2, self.cy)
+            return (self.vR - 2, py)
         if e == "left":
-            return (self.vL + 2, self.cy)
+            return (self.vL + 2, py)
         if e == "top":
-            return (self.cx, self.vT + 2)
-        return (self.cx, self.vB - 2)
+            return (px, self.vT + 2)
+        return (px, self.vB - 2)
 
     # -- event filters (return False => suppress locally; raised by run()) --
     def mouse_filter(self):
@@ -384,7 +390,7 @@ class Controller:
         from pynput import mouse, keyboard
         self.connect()
         print(f"Glide controller {__version__} connected to {self.host}:{self.port}.")
-        print(f"   remote screen {self.rw}x{self.rh}")
+        print(f"   this screen {self.vW}x{self.vH}   |   other screen {self.rw}x{self.rh}")
         print()
         print(f"   Glide the cursor off the {self.edge.upper()} edge  ->  drive the OTHER PC")
         print("   Glide back the other way (or Ctrl+Alt+G)  ->  return to THIS PC")

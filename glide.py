@@ -3,9 +3,11 @@
 Glide - one mouse & keyboard, every screen.
 
 A free, open-source software KVM. Run the receiver on your second PC, run the
-controller on the PC whose mouse/keyboard you want to share. Then just press
-CTRL+ALT+G to send your mouse & keyboard to the other PC, and Ctrl+Alt+G
-again to come back. Simple and reliable - no edge-sliding to misfire.
+controller on the PC whose mouse/keyboard you want to share. Then just glide
+your cursor off the screen edge (default: right) and it crosses to the other
+PC, like one big desktop spanning both machines. Glide back to return.
+Ctrl+Alt+G is a manual toggle / failsafe. Edge uses the whole virtual desktop,
+so it works with multiple monitors.
 
 Original clean-room implementation. MIT licensed. Windows.
 
@@ -25,7 +27,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 DEFAULT_PORT = 24800
 
 # ---------------------------------------------------------------------------
@@ -142,17 +144,49 @@ BTN_UP = {WM_LBUTTONUP: "left", WM_RBUTTONUP: "right", WM_MBUTTONUP: "middle"}
 
 
 class Controller:
-    def __init__(self, host, port):
+    def __init__(self, host, port, edge="right"):
         self.host = host
         self.port = port
+        self.edge = edge             # which outer screen edge crosses to the other PC
         self.sock = None
         self.active = False          # True = input is being forwarded
         self.user32 = ctypes.windll.user32
-        self.W = self.user32.GetSystemMetrics(0)
-        self.H = self.user32.GetSystemMetrics(1)
-        self.cx, self.cy = self.W // 2, self.H // 2
+        # Use the WHOLE virtual desktop (all monitors), so "right edge" is the
+        # true outer edge of the rightmost monitor - not a seam between monitors.
+        vl = self.user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+        vt = self.user32.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+        vw = self.user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+        vh = self.user32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+        self.vL, self.vT = vl, vt
+        self.vR, self.vB = vl + vw - 1, vt + vh - 1
+        self.cx, self.cy = vl + vw // 2, vt + vh // 2   # warp target: desktop center
+        self._cross = 0              # travel past the crossing edge while active
         self._mods = set()           # Ctrl/Alt keys currently held down
         self._ml = self._kl = None   # listeners, set in run()
+
+    # -- screen-edge geometry ----------------------------------------------
+    def _at_edge(self, x, y):
+        e = self.edge
+        return ((e == "right" and x >= self.vR) or (e == "left" and x <= self.vL) or
+                (e == "top" and y <= self.vT) or (e == "bottom" and y >= self.vB))
+
+    def _crossed_back(self):
+        # True once the user has dragged back across the entry edge.
+        if self.edge in ("right", "bottom"):
+            return self._cross <= 0
+        return self._cross >= 0
+
+    def _park_inside_edge(self):
+        # Drop the real cursor just inside the edge so it doesn't instantly re-cross.
+        e = self.edge
+        if e == "right":
+            self.user32.SetCursorPos(self.vR - 2, self.cy)
+        elif e == "left":
+            self.user32.SetCursorPos(self.vL + 2, self.cy)
+        elif e == "top":
+            self.user32.SetCursorPos(self.cx, self.vT + 2)
+        else:
+            self.user32.SetCursorPos(self.cx, self.vB - 2)
 
     # -- networking --------------------------------------------------------
     def connect(self):
@@ -183,9 +217,10 @@ class Controller:
     # -- control handoff (Ctrl+Alt+G) --------------------------------------
     def grab(self):
         self.active = True
+        self._cross = 0
         self.set_block(True)                 # freeze local input...
         self.warp_center()                   # ...and park the cursor at center
-        print(">>> NOW CONTROLLING THE OTHER PC   (Ctrl+Alt+G to come back)")
+        print(">>> NOW CONTROLLING THE OTHER PC   (glide back / Ctrl+Alt+G to return)")
 
     def release(self):
         if not self.active:
@@ -209,12 +244,21 @@ class Controller:
     def mouse_filter(self):
         def f(msg, data):
             if not self.active:
-                return True                       # pass everything through locally
+                # Glide into the other PC the instant the cursor hits the edge.
+                if msg == WM_MOUSEMOVE and self._at_edge(data.pt.x, data.pt.y):
+                    self.grab()
+                    return False
+                return True                       # otherwise everything is local
             if msg == WM_MOUSEMOVE:
                 dx, dy = data.pt.x - self.cx, data.pt.y - self.cy
                 if dx or dy:                      # ignore our own re-center echo
                     self.send({"t": "mv", "dx": dx, "dy": dy})
-                    self.warp_center()
+                    self._cross += dx if self.edge in ("right", "left") else dy
+                    if self._crossed_back():      # dragged back over the edge -> return
+                        self.release()
+                        self._park_inside_edge()
+                    else:
+                        self.warp_center()
                 return False
             if msg in BTN_DOWN:
                 self.send({"t": "btn", "b": BTN_DOWN[msg], "p": True})
@@ -254,9 +298,9 @@ class Controller:
         self.connect()
         print(f"Glide controller {__version__} connected to {self.host}:{self.port}.")
         print()
-        print("   Press CTRL+ALT+G  ->  your mouse & keyboard drive the OTHER PC")
-        print("   Press CTRL+ALT+G  ->  come back to THIS PC")
-        print("   Close this window to quit.")
+        print(f"   Glide the cursor off the {self.edge.upper()} edge  ->  drive the OTHER PC")
+        print("   Glide back the other way (or Ctrl+Alt+G)  ->  return to THIS PC")
+        print("   Ctrl+Alt+G is also a manual toggle / failsafe. Close window to quit.")
         print()
         minner, kinner = self.mouse_filter(), self.key_filter()
 
@@ -356,7 +400,11 @@ def controller_logic_test():
     assert c.active is False
     assert mf(WM_MOUSEMOVE, MData(c.cx + 2, c.cy + 2)) is True
 
-    print("controller logic OK: switch, move, click, key, switch-back all correct.")
+    # glide to the far RIGHT edge of the virtual desktop -> auto-cross, no key
+    assert mf(WM_MOUSEMOVE, MData(c.vR, c.cy)) is False
+    assert c.active is True
+
+    print("controller logic OK: edge-cross, switch, move, click, key, back all correct.")
 
 
 def selftest():
@@ -373,6 +421,8 @@ def main():
     p.add_argument("role", nargs="?", choices=["receiver", "controller"])
     p.add_argument("--host", help="receiver IP (controller mode)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--edge", default="right", choices=["left", "right", "top", "bottom"],
+                   help="screen edge that glides to the other PC (default: right)")
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args()
 
@@ -400,7 +450,7 @@ def main():
             print("No receiver IP given.")
             sys.exit(1)
         try:
-            Controller(host, args.port).run()
+            Controller(host, args.port, args.edge).run()
         except (ConnectionRefusedError, OSError) as e:
             print(f"Could not reach receiver {host}:{args.port} -> {e}")
             print("Is the receiver running and the port open in the firewall?")

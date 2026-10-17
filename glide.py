@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 DEFAULT_PORT = 24800
 
 # ---------------------------------------------------------------------------
@@ -218,8 +218,10 @@ class Controller:
     def grab(self):
         self.active = True
         self._cross = 0
-        self.set_block(True)                 # freeze local input...
-        self.warp_center()                   # ...and park the cursor at center
+        # Hook-suppression already freezes the local cursor; do NOT BlockInput
+        # here - it stops our own SetCursorPos re-centering, which made every
+        # move compute a giant delta and slammed the remote cursor to a corner.
+        self.warp_center()                   # park the cursor at center
         print(">>> NOW CONTROLLING THE OTHER PC   (glide back / Ctrl+Alt+G to return)")
 
     def release(self):
@@ -251,6 +253,9 @@ class Controller:
                 return True                       # otherwise everything is local
             if msg == WM_MOUSEMOVE:
                 dx, dy = data.pt.x - self.cx, data.pt.y - self.cy
+                if abs(dx) > 500 or abs(dy) > 500:   # ponytail: warp desync, re-center
+                    self.warp_center()               # and drop this bogus giant jump
+                    return False
                 if dx or dy:                      # ignore our own re-center echo
                     self.send({"t": "mv", "dx": dx, "dy": dy})
                     self._cross += dx if self.edge in ("right", "left") else dy

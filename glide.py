@@ -4,7 +4,7 @@ Glide - one mouse & keyboard, every screen.
 
 A free, open-source software KVM. Run the receiver on your second PC, run the
 controller on the PC whose mouse/keyboard you want to share. Then just press
-SCROLL LOCK to send your mouse & keyboard to the other PC, and Scroll Lock
+CTRL+ALT+G to send your mouse & keyboard to the other PC, and Ctrl+Alt+G
 again to come back. Simple and reliable - no edge-sliding to misfire.
 
 Original clean-room implementation. MIT licensed. Windows.
@@ -130,7 +130,11 @@ WM_MBUTTONDOWN, WM_MBUTTONUP = 0x0207, 0x0208
 WM_MOUSEWHEEL, WM_MOUSEHWHEEL = 0x020A, 0x020E
 WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
 WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
-VK_SCROLL = 0x91
+# Switch hotkey: Ctrl + Alt + G. Track every Ctrl/Alt variant the hook reports.
+VK_G = 0x47
+CTRL_VKS = {0x11, 0xA2, 0xA3}
+ALT_VKS = {0x12, 0xA4, 0xA5}
+MOD_VKS = CTRL_VKS | ALT_VKS
 
 BTN_DOWN = {WM_LBUTTONDOWN: "left", WM_RBUTTONDOWN: "right", WM_MBUTTONDOWN: "middle"}
 BTN_UP = {WM_LBUTTONUP: "left", WM_RBUTTONUP: "right", WM_MBUTTONUP: "middle"}
@@ -146,6 +150,7 @@ class Controller:
         self.W = self.user32.GetSystemMetrics(0)
         self.H = self.user32.GetSystemMetrics(1)
         self.cx, self.cy = self.W // 2, self.H // 2
+        self._mods = set()           # Ctrl/Alt keys currently held down
 
     # -- networking --------------------------------------------------------
     def connect(self):
@@ -168,12 +173,12 @@ class Controller:
     def grab(self):
         self.active = True
         self.warp_center()
-        print(">>> NOW CONTROLLING THE OTHER PC   (Scroll Lock to come back)")
+        print(">>> NOW CONTROLLING THE OTHER PC   (Ctrl+Alt+G to come back)")
 
     def release(self):
         if self.active:
             self.active = False
-            print("<<< BACK ON THIS PC                (Scroll Lock to switch again)")
+            print("<<< BACK ON THIS PC                (Ctrl+Alt+G to switch again)")
 
     def toggle(self):
         self.release() if self.active else self.grab()
@@ -207,16 +212,22 @@ class Controller:
 
     def key_filter(self):
         def f(msg, data):
-            if data.vkCode == VK_SCROLL:          # the switch / failsafe
-                if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                    self.toggle()
-                return False                      # eat both down and up
+            vk = data.vkCode
+            down = msg in (WM_KEYDOWN, WM_SYSKEYDOWN)
+            up = msg in (WM_KEYUP, WM_SYSKEYUP)
+            # Track Ctrl/Alt so we can spot the switch combo (works local or active).
+            if vk in MOD_VKS:
+                self._mods.add(vk) if down else self._mods.discard(vk)
+            # Ctrl + Alt + G toggles control; swallow the G so it isn't typed.
+            if down and vk == VK_G and (self._mods & CTRL_VKS) and (self._mods & ALT_VKS):
+                self.toggle()
+                return False
             if not self.active:
                 return True
-            if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                self.send({"t": "key", "vk": data.vkCode, "p": True})
-            elif msg in (WM_KEYUP, WM_SYSKEYUP):
-                self.send({"t": "key", "vk": data.vkCode, "p": False})
+            if down:
+                self.send({"t": "key", "vk": vk, "p": True})
+            elif up:
+                self.send({"t": "key", "vk": vk, "p": False})
             return False
         return f
 
@@ -225,8 +236,8 @@ class Controller:
         self.connect()
         print(f"Glide controller {__version__} connected to {self.host}:{self.port}.")
         print()
-        print("   Press SCROLL LOCK  ->  your mouse & keyboard drive the OTHER PC")
-        print("   Press SCROLL LOCK  ->  come back to THIS PC")
+        print("   Press CTRL+ALT+G  ->  your mouse & keyboard drive the OTHER PC")
+        print("   Press CTRL+ALT+G  ->  come back to THIS PC")
         print("   Close this window to quit.")
         print()
         ml = mouse.Listener(win32_event_filter=self.mouse_filter(), suppress=False)
@@ -292,8 +303,10 @@ def controller_logic_test():
     assert mf(WM_MOUSEMOVE, MData(c.cx + 9, c.cy)) is True
     assert c.sent == []
 
-    # Scroll Lock -> active
-    assert kf(WM_KEYDOWN, KData(VK_SCROLL)) is False
+    # Ctrl+Alt+G -> active (G is swallowed, not typed)
+    kf(WM_KEYDOWN, KData(0x11))                      # Ctrl down
+    kf(WM_KEYDOWN, KData(0x12))                      # Alt down
+    assert kf(WM_KEYDOWN, KData(VK_G)) is False      # G completes the combo
     assert c.active is True
 
     # active: a move forwards the delta-from-center and is suppressed locally
@@ -306,8 +319,8 @@ def controller_logic_test():
     assert kf(WM_KEYDOWN, KData(65)) is False
     assert c.sent[-1] == {"t": "key", "vk": 65, "p": True}
 
-    # Scroll Lock again -> inactive, moves pass through again
-    assert kf(WM_KEYDOWN, KData(VK_SCROLL)) is False
+    # Ctrl+Alt still held: tapping G again -> inactive, moves pass through
+    assert kf(WM_KEYDOWN, KData(VK_G)) is False
     assert c.active is False
     assert mf(WM_MOUSEMOVE, MData(c.cx + 2, c.cy + 2)) is True
 

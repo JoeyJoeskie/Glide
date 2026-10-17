@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 DEFAULT_PORT = 24800
 
 # ---------------------------------------------------------------------------
@@ -151,6 +151,7 @@ class Controller:
         self.H = self.user32.GetSystemMetrics(1)
         self.cx, self.cy = self.W // 2, self.H // 2
         self._mods = set()           # Ctrl/Alt keys currently held down
+        self._ml = self._kl = None   # listeners, set in run()
 
     # -- networking --------------------------------------------------------
     def connect(self):
@@ -176,17 +177,22 @@ class Controller:
         print(">>> NOW CONTROLLING THE OTHER PC   (Ctrl+Alt+G to come back)")
 
     def release(self):
-        if self.active:
-            self.active = False
-            print("<<< BACK ON THIS PC                (Ctrl+Alt+G to switch again)")
+        if not self.active:
+            return
+        self.active = False
+        for vk in list(self._mods):          # don't leave Ctrl/Alt stuck on the remote
+            self.send({"t": "key", "vk": vk, "p": False})
+        print("<<< BACK ON THIS PC                (Ctrl+Alt+G to switch again)")
 
     def toggle(self):
         self.release() if self.active else self.grab()
 
     # -- event filters -----------------------------------------------------
-    # pynput suppresses the event when the filter returns False; True/None
-    # lets it reach the local machine normally. Keep these fast: they run in
-    # the low-level hook thread and Windows unhooks us if we stall.
+    # These INNER filters return False to mean "suppress this event locally",
+    # True/None to mean "let it through". run() wraps them so a False result
+    # calls listener.suppress_event() (which raises) - the only thing pynput
+    # actually honours synchronously to block the OS event. Keep them fast:
+    # they run in the low-level hook thread and Windows unhooks us if we stall.
     # ponytail: send() blocks on sendall here; add a sender queue if LAN lags.
     def mouse_filter(self):
         def f(msg, data):
@@ -240,18 +246,28 @@ class Controller:
         print("   Press CTRL+ALT+G  ->  come back to THIS PC")
         print("   Close this window to quit.")
         print()
-        ml = mouse.Listener(win32_event_filter=self.mouse_filter(), suppress=False)
-        kl = keyboard.Listener(win32_event_filter=self.key_filter(), suppress=False)
-        ml.start()
-        kl.start()
+        minner, kinner = self.mouse_filter(), self.key_filter()
+
+        def mouse_wf(msg, data):
+            if minner(msg, data) is False:
+                self._ml.suppress_event()     # raise -> truly block the local event
+
+        def key_wf(msg, data):
+            if kinner(msg, data) is False:
+                self._kl.suppress_event()
+
+        self._ml = mouse.Listener(win32_event_filter=mouse_wf, suppress=False)
+        self._kl = keyboard.Listener(win32_event_filter=key_wf, suppress=False)
+        self._ml.start()
+        self._kl.start()
         try:
-            while ml.running and kl.running:
+            while self._ml.running and self._kl.running:
                 time.sleep(0.2)
         except KeyboardInterrupt:
             pass
         finally:
-            ml.stop()
-            kl.stop()
+            self._ml.stop()
+            self._kl.stop()
 
 
 # ---------------------------------------------------------------------------

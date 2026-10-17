@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 DEFAULT_PORT = 24800
 
 # ---------------------------------------------------------------------------
@@ -96,6 +96,57 @@ def virtual_box(user32):
     return x0, y0, w, h
 
 
+# --- clipboard (Windows CF_UNICODETEXT) -----------------------------------
+if sys.platform == "win32":
+    _CF_UNICODETEXT = 13
+    _GMEM_MOVEABLE = 0x0002
+    _u32 = ctypes.windll.user32
+    _k32 = ctypes.windll.kernel32
+    _u32.GetClipboardData.restype = ctypes.c_void_p
+    _k32.GlobalLock.restype = ctypes.c_void_p
+    _k32.GlobalLock.argtypes = [ctypes.c_void_p]
+    _k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    _k32.GlobalAlloc.restype = ctypes.c_void_p
+    _k32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+
+
+def get_clipboard_text():
+    if sys.platform != "win32" or not _u32.OpenClipboard(0):
+        return None
+    try:
+        h = _u32.GetClipboardData(_CF_UNICODETEXT)
+        if not h:
+            return None
+        p = _k32.GlobalLock(h)
+        if not p:
+            return None
+        try:
+            return ctypes.c_wchar_p(p).value
+        finally:
+            _k32.GlobalUnlock(h)
+    except Exception:
+        return None
+    finally:
+        _u32.CloseClipboard()
+
+
+def set_clipboard_text(s):
+    if sys.platform != "win32" or not _u32.OpenClipboard(0):
+        return
+    try:
+        _u32.EmptyClipboard()
+        data = s.encode("utf-16-le") + b"\x00\x00"
+        h = _k32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
+        p = _k32.GlobalLock(h)
+        ctypes.memmove(p, data, len(data))
+        _k32.GlobalUnlock(h)
+        _u32.SetClipboardData(_CF_UNICODETEXT, h)   # ownership passes to clipboard
+    except Exception:
+        pass
+    finally:
+        _u32.CloseClipboard()
+
+
 # ---------------------------------------------------------------------------
 # Receiver: announce its screen box, then inject whatever the controller sends.
 # ---------------------------------------------------------------------------
@@ -154,8 +205,30 @@ def run_receiver(port: int, code: str = ""):
                 continue
             conn.sendall(encode({"t": "hello", "x0": x0, "y0": y0, "w": w, "h": h}))
             print(f"Controller connected from {addr[0]}. Control is live.")
-            for msg in gen:
-                handle(msg)
+            last_clip = {"v": get_clipboard_text()}
+            stop = threading.Event()
+
+            def clip_watch():
+                while not stop.is_set():
+                    t = get_clipboard_text()
+                    if t and t != last_clip["v"]:
+                        last_clip["v"] = t
+                        try:
+                            conn.sendall(encode({"t": "clip", "text": t}))
+                        except OSError:
+                            return
+                    stop.wait(0.4)
+
+            threading.Thread(target=clip_watch, daemon=True).start()
+            try:
+                for msg in gen:
+                    if msg.get("t") == "clip":
+                        last_clip["v"] = msg["text"]
+                        set_clipboard_text(msg["text"])
+                    else:
+                        handle(msg)
+            finally:
+                stop.set()
         except (ConnectionResetError, OSError, json.JSONDecodeError) as e:
             print(f"Connection dropped: {e}")
         finally:
@@ -206,21 +279,26 @@ class Controller:
         self._mods = set()
         self._ml = self._kl = None
         self._q = queue.Queue()
+        self._rx = None              # inbound message generator (set in connect)
+        self._last_clip = None       # last clipboard text seen/applied (echo guard)
 
     # -- networking --------------------------------------------------------
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.host, self.port))
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._rx = iter_messages(self.sock)
         self.sock.sendall(encode({"t": "auth", "code": self.code}))   # authenticate first
         self._handshake()
         threading.Thread(target=self._sender_loop, daemon=True).start()
+        threading.Thread(target=self._reader_loop, daemon=True).start()
+        threading.Thread(target=self._clip_watch, daemon=True).start()
 
     def _handshake(self):
         # Expect the receiver's screen box, or a refusal if the password is wrong.
         self.sock.settimeout(5)
         try:
-            msg = next(iter_messages(self.sock), None)
+            msg = next(self._rx, None)
         except (OSError, json.JSONDecodeError):
             msg = None
         finally:
@@ -232,6 +310,25 @@ class Controller:
             self.rw, self.rh = msg["w"], msg["h"]
         else:
             print("No hello from receiver (old version?); assuming same screen size.")
+
+    def _reader_loop(self):
+        # Inbound from the receiver: currently just clipboard updates.
+        try:
+            for msg in self._rx:
+                if msg.get("t") == "clip":
+                    self._last_clip = msg["text"]
+                    set_clipboard_text(msg["text"])
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def _clip_watch(self):
+        # Push our clipboard to the receiver whenever it changes.
+        while True:
+            t = get_clipboard_text()
+            if t and t != self._last_clip:
+                self._last_clip = t
+                self.send({"t": "clip", "text": t})
+            time.sleep(0.4)
 
     def send(self, msg: dict):
         self._q.put(msg)             # enqueue only; sender thread does the write

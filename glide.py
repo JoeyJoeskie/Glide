@@ -5,9 +5,9 @@ Glide - one mouse & keyboard, every screen.
 A free, open-source software KVM. Run the receiver on your second PC, run the
 controller on the PC whose mouse/keyboard you want to share. Then just glide
 your cursor off the screen edge (default: right) and it crosses to the other
-PC, like one big desktop spanning both machines. Glide back to return.
-Ctrl+Alt+G is a manual toggle / failsafe. Edge uses the whole virtual desktop,
-so it works with multiple monitors.
+PC, like one big desktop spanning both machines. Glide back the other way to
+return. Ctrl+Alt+G is a manual toggle / failsafe. Edge detection and crossing
+use the whole virtual desktop, so it works with multiple monitors.
 
 Original clean-room implementation. MIT licensed. Windows.
 
@@ -18,7 +18,6 @@ Usage:
     glide.py --selftest                     # run the built-in checks
 """
 import argparse
-import atexit
 import ctypes
 import json
 import queue
@@ -28,15 +27,18 @@ import sys
 import threading
 import time
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 DEFAULT_PORT = 24800
 
 # ---------------------------------------------------------------------------
 # Wire protocol: newline-delimited JSON, one event per line.
-#   {"t":"mv","dx":int,"dy":int}            relative mouse motion
-#   {"t":"btn","b":"left|right|middle","p":bool}
-#   {"t":"scroll","dx":int,"dy":int}
-#   {"t":"key","vk":int,"p":bool}           virtual-key code, press/release
+#   receiver -> controller on connect:
+#     {"t":"hello","x0":int,"y0":int,"w":int,"h":int}   its virtual-desktop box
+#   controller -> receiver:
+#     {"t":"mva","x":int,"y":int}            absolute cursor position (physical px)
+#     {"t":"btn","b":"left|right|middle","p":bool}
+#     {"t":"scroll","dx":int,"dy":int}
+#     {"t":"key","vk":int,"p":bool}          virtual-key code, press/release
 # ---------------------------------------------------------------------------
 
 
@@ -56,9 +58,8 @@ def local_ip() -> str:
         s.close()
 
 
-def iter_messages(sock: socket.socket):
+def iter_messages(sock: socket.socket, buf=b""):
     """Yield decoded messages from a socket, framed by newlines."""
-    buf = b""
     while True:
         chunk = sock.recv(4096)
         if not chunk:
@@ -70,12 +71,41 @@ def iter_messages(sock: socket.socket):
                 yield json.loads(line)
 
 
+def enable_dpi_awareness():
+    # Make screen metrics, SetCursorPos and the low-level hook all agree on
+    # PHYSICAL pixels. Without this, on a scaled/high-DPI display the hook and
+    # metrics use different coordinate scales and crossing geometry is wrong.
+    for attempt in (
+        lambda: ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)),
+        lambda: ctypes.windll.shcore.SetProcessDpiAwareness(2),
+        lambda: ctypes.windll.user32.SetProcessDPIAware(),
+    ):
+        try:
+            if attempt():
+                return
+        except Exception:
+            continue
+
+
+def virtual_box(user32):
+    """(x0, y0, w, h) of the whole virtual desktop in physical pixels."""
+    x0 = user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+    y0 = user32.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+    w = user32.GetSystemMetrics(78)    # SM_CXVIRTUALSCREEN
+    h = user32.GetSystemMetrics(79)    # SM_CYVIRTUALSCREEN
+    return x0, y0, w, h
+
+
 # ---------------------------------------------------------------------------
-# Receiver: listen, inject whatever the controller sends.
+# Receiver: announce its screen box, then inject whatever the controller sends.
 # ---------------------------------------------------------------------------
 
 def run_receiver(port: int):
     from pynput import mouse, keyboard
+
+    enable_dpi_awareness()
+    user32 = ctypes.windll.user32
+    x0, y0, w, h = virtual_box(user32)
 
     mc = mouse.Controller()
     kc = keyboard.Controller()
@@ -85,7 +115,9 @@ def run_receiver(port: int):
 
     def handle(msg: dict):
         t = msg.get("t")
-        if t == "mv":
+        if t == "mva":
+            user32.SetCursorPos(int(msg["x"]), int(msg["y"]))
+        elif t == "mv":                      # legacy relative move
             mc.move(msg["dx"], msg["dy"])
         elif t == "btn":
             b = buttons.get(msg["b"])
@@ -112,8 +144,9 @@ def run_receiver(port: int):
     while True:
         conn, addr = srv.accept()
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # low-latency inject
-        print(f"Controller connected from {addr[0]}. Control is live.")
         try:
+            conn.sendall(encode({"t": "hello", "x0": x0, "y0": y0, "w": w, "h": h}))
+            print(f"Controller connected from {addr[0]}. Control is live.")
             for msg in iter_messages(conn):
                 handle(msg)
         except (ConnectionResetError, OSError, json.JSONDecodeError) as e:
@@ -124,10 +157,9 @@ def run_receiver(port: int):
 
 
 # ---------------------------------------------------------------------------
-# Controller: capture local input, forward it while "active" (Scroll Lock on).
+# Controller: capture local input, model the remote cursor, forward absolute.
 # ---------------------------------------------------------------------------
 
-# Win32 message codes
 WM_MOUSEMOVE = 0x0200
 WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0201, 0x0202
 WM_RBUTTONDOWN, WM_RBUTTONUP = 0x0204, 0x0205
@@ -135,7 +167,6 @@ WM_MBUTTONDOWN, WM_MBUTTONUP = 0x0207, 0x0208
 WM_MOUSEWHEEL, WM_MOUSEHWHEEL = 0x020A, 0x020E
 WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
 WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
-# Switch hotkey: Ctrl + Alt + G. Track every Ctrl/Alt variant the hook reports.
 VK_G = 0x47
 CTRL_VKS = {0x11, 0xA2, 0xA3}
 ALT_VKS = {0x12, 0xA4, 0xA5}
@@ -145,81 +176,52 @@ BTN_DOWN = {WM_LBUTTONDOWN: "left", WM_RBUTTONDOWN: "right", WM_MBUTTONDOWN: "mi
 BTN_UP = {WM_LBUTTONUP: "left", WM_RBUTTONUP: "right", WM_MBUTTONUP: "middle"}
 
 
-def enable_dpi_awareness():
-    # Make screen metrics, SetCursorPos and the low-level hook all agree on
-    # PHYSICAL pixels. Without this, on a scaled/high-DPI display the hook
-    # reports a different coordinate scale than GetSystemMetrics, so warp-to-
-    # center never lines up and every move becomes a huge bogus delta.
-    for attempt in (
-        lambda: ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)),
-        lambda: ctypes.windll.shcore.SetProcessDpiAwareness(2),
-        lambda: ctypes.windll.user32.SetProcessDPIAware(),
-    ):
-        try:
-            if attempt():
-                return
-        except Exception:
-            continue
+def _clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
 
 
 class Controller:
     def __init__(self, host, port, edge="right"):
         self.host = host
         self.port = port
-        self.edge = edge             # which outer screen edge crosses to the other PC
+        self.edge = edge
         self.sock = None
-        self.active = False          # True = input is being forwarded
-        enable_dpi_awareness()       # MUST run before reading metrics below
+        self.active = False
+        enable_dpi_awareness()
         self.user32 = ctypes.windll.user32
-        # Use the WHOLE virtual desktop (all monitors), so "right edge" is the
-        # true outer edge of the rightmost monitor - not a seam between monitors.
-        vl = self.user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
-        vt = self.user32.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
-        vw = self.user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
-        vh = self.user32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
-        self.vL, self.vT = vl, vt
-        self.vR, self.vB = vl + vw - 1, vt + vh - 1
-        self.cx, self.cy = vl + vw // 2, vt + vh // 2   # warp target: desktop center
-        self._cross = 0              # travel past the crossing edge while active
-        self._mods = set()           # Ctrl/Alt keys currently held down
-        self._ml = self._kl = None   # listeners, set in run()
-        self._q = queue.Queue()      # outbound events; drained by a sender thread
-
-    # -- screen-edge geometry ----------------------------------------------
-    def _at_edge(self, x, y):
-        e = self.edge
-        return ((e == "right" and x >= self.vR) or (e == "left" and x <= self.vL) or
-                (e == "top" and y <= self.vT) or (e == "bottom" and y >= self.vB))
-
-    def _crossed_back(self):
-        # True once the user has dragged back across the entry edge.
-        if self.edge in ("right", "bottom"):
-            return self._cross <= 0
-        return self._cross >= 0
-
-    def _park_inside_edge(self):
-        # Drop the real cursor just inside the edge so it doesn't instantly re-cross.
-        e = self.edge
-        if e == "right":
-            self.user32.SetCursorPos(self.vR - 2, self.cy)
-        elif e == "left":
-            self.user32.SetCursorPos(self.vL + 2, self.cy)
-        elif e == "top":
-            self.user32.SetCursorPos(self.cx, self.vT + 2)
-        else:
-            self.user32.SetCursorPos(self.cx, self.vB - 2)
+        self.vL, self.vT, self.vW, self.vH = virtual_box(self.user32)
+        self.vR, self.vB = self.vL + self.vW - 1, self.vT + self.vH - 1
+        self.cx, self.cy = self.vL + self.vW // 2, self.vT + self.vH // 2  # warp target
+        # remote screen box (filled from the receiver's hello); own box as fallback
+        self.rx0, self.ry0, self.rw, self.rh = self.vL, self.vT, self.vW, self.vH
+        self.rx = self.ry = 0            # modelled remote cursor (0..rw-1, 0..rh-1)
+        self._mods = set()
+        self._ml = self._kl = None
+        self._q = queue.Queue()
 
     # -- networking --------------------------------------------------------
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.host, self.port))
-        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # no Nagle lag
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._read_hello()
         threading.Thread(target=self._sender_loop, daemon=True).start()
 
+    def _read_hello(self):
+        # The receiver announces its screen box first. Tolerate an old receiver.
+        self.sock.settimeout(4)
+        try:
+            msg = next(iter_messages(self.sock))
+            if msg.get("t") == "hello":
+                self.rx0, self.ry0 = msg["x0"], msg["y0"]
+                self.rw, self.rh = msg["w"], msg["h"]
+        except (StopIteration, OSError, json.JSONDecodeError):
+            print("No hello from receiver (old version?); assuming same screen size.")
+        finally:
+            self.sock.settimeout(None)
+
     def send(self, msg: dict):
-        # Called from the hook thread: just enqueue so capture never blocks on
-        # the network. The sender thread does the actual socket write.
-        self._q.put(msg)
+        self._q.put(msg)             # enqueue only; sender thread does the write
 
     def _sender_loop(self):
         while True:
@@ -233,7 +235,7 @@ class Controller:
             except queue.Empty:
                 pass
             stop = None in batch
-            for m in self._coalesce(x for x in batch if x is not None):
+            for m in self._coalesce([x for x in batch if x is not None]):
                 try:
                     self.sock.sendall(encode(m))
                 except OSError as e:
@@ -245,81 +247,107 @@ class Controller:
 
     @staticmethod
     def _coalesce(msgs):
-        # Merge consecutive mouse-moves into one (sum deltas) to catch up
-        # smoothly under load instead of replaying a backlog of tiny jumps.
+        # Collapse a backlog: consecutive absolute moves -> keep the latest;
+        # consecutive legacy relative moves -> sum. Clicks/keys break the run.
         out = []
         for m in msgs:
-            if m.get("t") == "mv" and out and out[-1]["t"] == "mv":
+            t = m.get("t")
+            if t == "mva" and out and out[-1]["t"] == "mva":
+                out[-1] = m
+            elif t == "mv" and out and out[-1]["t"] == "mv":
                 out[-1] = {"t": "mv", "dx": out[-1]["dx"] + m["dx"],
                            "dy": out[-1]["dy"] + m["dy"]}
             else:
                 out.append(m)
         return out
 
+    # -- cursor helpers ----------------------------------------------------
     def warp_center(self):
-        # Keep the real cursor pinned to screen center so every physical move
-        # produces a fresh delta we can forward (works on any monitor layout).
         self.user32.SetCursorPos(self.cx, self.cy)
 
-    def set_block(self, on):
-        # Hard OS-level freeze of local mouse+keyboard while the other PC is
-        # driven (ShareMouse does this too). Low-level hooks still fire under
-        # BlockInput, so Ctrl+Alt+G still releases; Ctrl+Alt+Del always escapes.
-        try:
-            self.user32.BlockInput(1 if on else 0)
-        except Exception:
-            pass
+    def _push_remote(self):
+        self.send({"t": "mva", "x": self.rx0 + self.rx, "y": self.ry0 + self.ry})
 
-    # -- control handoff (Ctrl+Alt+G) --------------------------------------
-    def grab(self):
+    # -- geometry ----------------------------------------------------------
+    def _at_edge(self, x, y):
+        e = self.edge
+        return ((e == "right" and x >= self.vR) or (e == "left" and x <= self.vL) or
+                (e == "top" and y <= self.vT) or (e == "bottom" and y >= self.vB))
+
+    def _entry_from(self, x, y):
+        # Where the remote cursor appears when we cross in: opposite edge, with
+        # the perpendicular position mapped proportionally from this screen.
+        fx = _clamp((x - self.vL) / max(1, self.vW), 0.0, 1.0)
+        fy = _clamp((y - self.vT) / max(1, self.vH), 0.0, 1.0)
+        if self.edge == "right":
+            return 0, int(fy * (self.rh - 1))
+        if self.edge == "left":
+            return self.rw - 1, int(fy * (self.rh - 1))
+        if self.edge == "top":
+            return int(fx * (self.rw - 1)), 0
+        return int(fx * (self.rw - 1)), self.rh - 1          # bottom
+
+    def _past_far_edge(self, nrx, nry):
+        # Dragged back out the entry edge -> hand control back to this PC.
+        e = self.edge
+        return ((e == "right" and nrx < 0) or (e == "left" and nrx > self.rw - 1) or
+                (e == "top" and nry < 0) or (e == "bottom" and nry > self.rh - 1))
+
+    # -- control handoff ---------------------------------------------------
+    def enter(self, rx, ry):
         self.active = True
-        self._cross = 0
-        # Hook-suppression already freezes the local cursor; do NOT BlockInput
-        # here - it stops our own SetCursorPos re-centering, which made every
-        # move compute a giant delta and slammed the remote cursor to a corner.
-        self.warp_center()                   # park the cursor at center
+        self.rx, self.ry = _clamp(rx, 0, self.rw - 1), _clamp(ry, 0, self.rh - 1)
+        self.warp_center()
+        self._push_remote()
         print(">>> NOW CONTROLLING THE OTHER PC   (glide back / Ctrl+Alt+G to return)")
 
-    def release(self):
+    def release(self, park=None):
         if not self.active:
             return
         self.active = False
-        self.set_block(False)                # ALWAYS unfreeze local input first
         for vk in list(self._mods):          # don't leave Ctrl/Alt stuck on the remote
             self.send({"t": "key", "vk": vk, "p": False})
-        print("<<< BACK ON THIS PC                (Ctrl+Alt+G to switch again)")
+        if park:
+            self.user32.SetCursorPos(*park)
+        print("<<< BACK ON THIS PC                (Ctrl+Alt+G / glide over to switch)")
 
     def toggle(self):
-        self.release() if self.active else self.grab()
+        if self.active:
+            self.release(park=(self.cx, self.cy))
+        else:
+            self.enter(self.rw // 2, self.rh // 2)   # hotkey entry: remote center
 
-    # -- event filters -----------------------------------------------------
-    # These INNER filters return False to mean "suppress this event locally",
-    # True/None to mean "let it through". run() wraps them so a False result
-    # calls listener.suppress_event() (which raises) - the only thing pynput
-    # actually honours synchronously to block the OS event. Keep them fast:
-    # they run in the low-level hook thread and Windows unhooks us if we stall.
-    # ponytail: send() blocks on sendall here; add a sender queue if LAN lags.
+    def _park_inside_edge(self):
+        e = self.edge
+        if e == "right":
+            return (self.vR - 2, self.cy)
+        if e == "left":
+            return (self.vL + 2, self.cy)
+        if e == "top":
+            return (self.cx, self.vT + 2)
+        return (self.cx, self.vB - 2)
+
+    # -- event filters (return False => suppress locally; raised by run()) --
     def mouse_filter(self):
         def f(msg, data):
             if not self.active:
-                # Glide into the other PC the instant the cursor hits the edge.
                 if msg == WM_MOUSEMOVE and self._at_edge(data.pt.x, data.pt.y):
-                    self.grab()
+                    self.enter(*self._entry_from(data.pt.x, data.pt.y))
                     return False
-                return True                       # otherwise everything is local
+                return True
             if msg == WM_MOUSEMOVE:
                 dx, dy = data.pt.x - self.cx, data.pt.y - self.cy
-                if abs(dx) > 500 or abs(dy) > 500:   # ponytail: warp desync, re-center
-                    self.warp_center()               # and drop this bogus giant jump
+                if abs(dx) > 500 or abs(dy) > 500:   # warp desync -> re-center, drop
+                    self.warp_center()
                     return False
-                if dx or dy:                      # ignore our own re-center echo
-                    self.send({"t": "mv", "dx": dx, "dy": dy})
-                    self._cross += dx if self.edge in ("right", "left") else dy
-                    if self._crossed_back():      # dragged back over the edge -> return
-                        self.release()
-                        self._park_inside_edge()
-                    else:
-                        self.warp_center()
+                if dx or dy:
+                    nrx, nry = self.rx + dx, self.ry + dy
+                    if self._past_far_edge(nrx, nry):
+                        self.release(park=self._park_inside_edge())
+                        return False
+                    self.rx, self.ry = _clamp(nrx, 0, self.rw - 1), _clamp(nry, 0, self.rh - 1)
+                    self._push_remote()
+                    self.warp_center()
                 return False
             if msg in BTN_DOWN:
                 self.send({"t": "btn", "b": BTN_DOWN[msg], "p": True})
@@ -338,10 +366,8 @@ class Controller:
             vk = data.vkCode
             down = msg in (WM_KEYDOWN, WM_SYSKEYDOWN)
             up = msg in (WM_KEYUP, WM_SYSKEYUP)
-            # Track Ctrl/Alt so we can spot the switch combo (works local or active).
             if vk in MOD_VKS:
                 self._mods.add(vk) if down else self._mods.discard(vk)
-            # Ctrl + Alt + G toggles control; swallow the G so it isn't typed.
             if down and vk == VK_G and (self._mods & CTRL_VKS) and (self._mods & ALT_VKS):
                 self.toggle()
                 return False
@@ -358,16 +384,17 @@ class Controller:
         from pynput import mouse, keyboard
         self.connect()
         print(f"Glide controller {__version__} connected to {self.host}:{self.port}.")
+        print(f"   remote screen {self.rw}x{self.rh}")
         print()
         print(f"   Glide the cursor off the {self.edge.upper()} edge  ->  drive the OTHER PC")
         print("   Glide back the other way (or Ctrl+Alt+G)  ->  return to THIS PC")
-        print("   Ctrl+Alt+G is also a manual toggle / failsafe. Close window to quit.")
+        print("   Close this window to quit.")
         print()
         minner, kinner = self.mouse_filter(), self.key_filter()
 
         def mouse_wf(msg, data):
             if minner(msg, data) is False:
-                self._ml.suppress_event()     # raise -> truly block the local event
+                self._ml.suppress_event()
 
         def key_wf(msg, data):
             if kinner(msg, data) is False:
@@ -375,8 +402,6 @@ class Controller:
 
         self._ml = mouse.Listener(win32_event_filter=mouse_wf, suppress=False)
         self._kl = keyboard.Listener(win32_event_filter=key_wf, suppress=False)
-        # Failsafe: whatever happens, never leave the OS input frozen.
-        atexit.register(lambda: self.user32.BlockInput(0))
         self._ml.start()
         self._kl.start()
         try:
@@ -385,8 +410,7 @@ class Controller:
         except KeyboardInterrupt:
             pass
         finally:
-            self.set_block(False)            # guaranteed unfreeze on any exit
-            self._q.put(None)                # stop the sender thread
+            self._q.put(None)
             self._ml.stop()
             self._kl.stop()
 
@@ -401,7 +425,7 @@ def wire_test():
     reader = threading.Thread(target=lambda: got.extend(iter_messages(a)), daemon=True)
     reader.start()
     sent = [
-        {"t": "mv", "dx": 5, "dy": -3},
+        {"t": "mva", "x": 5, "y": 7},
         {"t": "btn", "b": "left", "p": True},
         {"t": "scroll", "dx": 0, "dy": 2},
         {"t": "key", "vk": 65, "p": False},
@@ -430,51 +454,50 @@ def controller_logic_test():
         def __init__(self, vk):
             self.vkCode = vk
 
-    c = Controller("127.0.0.1", DEFAULT_PORT)
+    c = Controller("127.0.0.1", DEFAULT_PORT, "right")
     c.warp_center = lambda: None          # do NOT move the real cursor
-    c.set_block = lambda on: None         # do NOT freeze the real input
+    c.rx0, c.ry0, c.rw, c.rh = 0, 0, 1000, 800   # pretend remote is 1000x800
     c.sent = []
     c.send = c.sent.append
     mf, kf = c.mouse_filter(), c.key_filter()
 
-    # inactive: a move passes through locally, nothing is sent
-    assert mf(WM_MOUSEMOVE, MData(c.cx + 9, c.cy)) is True
+    # idle: a move in the middle passes through locally, nothing sent
+    assert mf(WM_MOUSEMOVE, MData(c.cx, c.cy)) is True
     assert c.sent == []
 
-    # Ctrl+Alt+G -> active (G is swallowed, not typed)
-    kf(WM_KEYDOWN, KData(0x11))                      # Ctrl down
-    kf(WM_KEYDOWN, KData(0x12))                      # Alt down
-    assert kf(WM_KEYDOWN, KData(VK_G)) is False      # G completes the combo
-    assert c.active is True
+    # glide to the far RIGHT edge -> cross in at the remote's LEFT edge (rx 0)
+    assert mf(WM_MOUSEMOVE, MData(c.vR, c.cy)) is False
+    assert c.active is True and c.rx == 0
+    assert c.sent[-1] == {"t": "mva", "x": 0, "y": c.ry0 + c.ry}
 
-    # active: a move forwards the delta-from-center and is suppressed locally
-    assert mf(WM_MOUSEMOVE, MData(c.cx + 5, c.cy - 3)) is False
-    assert c.sent[-1] == {"t": "mv", "dx": 5, "dy": -3}
+    # roam RIGHT into the remote: absolute x grows, stays active
+    assert mf(WM_MOUSEMOVE, MData(c.cx + 40, c.cy)) is False
+    assert c.active is True and c.rx == 40
+    assert c.sent[-1] == {"t": "mva", "x": 40, "y": c.ry0 + c.ry}
 
-    # active: left click and a letter key forward
+    # roam back LEFT but still on-screen: stays active (the old "invisible wall" bug)
+    assert mf(WM_MOUSEMOVE, MData(c.cx - 30, c.cy)) is False
+    assert c.active is True and c.rx == 10
+
+    # a left click and a letter key forward while active
     assert mf(WM_LBUTTONDOWN, MData(c.cx, c.cy)) is False
     assert c.sent[-1] == {"t": "btn", "b": "left", "p": True}
     assert kf(WM_KEYDOWN, KData(65)) is False
     assert c.sent[-1] == {"t": "key", "vk": 65, "p": True}
 
-    # Ctrl+Alt still held: tapping G again -> inactive, moves pass through
-    assert kf(WM_KEYDOWN, KData(VK_G)) is False
+    # push past the remote's LEFT edge -> hand control back to THIS PC
+    assert mf(WM_MOUSEMOVE, MData(c.cx - 20, c.cy)) is False
     assert c.active is False
-    assert mf(WM_MOUSEMOVE, MData(c.cx + 2, c.cy + 2)) is True
 
-    # glide to the far RIGHT edge of the virtual desktop -> auto-cross, no key
-    assert mf(WM_MOUSEMOVE, MData(c.vR, c.cy)) is False
-    assert c.active is True
-
-    # consecutive mouse-moves coalesce; clicks break the run and keep order
+    # absolute moves coalesce to the latest; clicks keep order
     merged = Controller._coalesce([
-        {"t": "mv", "dx": 1, "dy": 2}, {"t": "mv", "dx": 3, "dy": -1},
-        {"t": "btn", "b": "left", "p": True}, {"t": "mv", "dx": 5, "dy": 5}])
-    assert merged == [{"t": "mv", "dx": 4, "dy": 1},
+        {"t": "mva", "x": 1, "y": 1}, {"t": "mva", "x": 2, "y": 2},
+        {"t": "btn", "b": "left", "p": True}, {"t": "mva", "x": 9, "y": 9}])
+    assert merged == [{"t": "mva", "x": 2, "y": 2},
                       {"t": "btn", "b": "left", "p": True},
-                      {"t": "mv", "dx": 5, "dy": 5}]
+                      {"t": "mva", "x": 9, "y": 9}]
 
-    print("controller logic OK: edge-cross, switch, move, click, key, coalesce all OK.")
+    print("controller logic OK: cross-in, roam both ways, far-edge return, coalesce.")
 
 
 def selftest():

@@ -3,9 +3,9 @@
 Glide - one mouse & keyboard, every screen.
 
 A free, open-source software KVM. Run the receiver on your second PC, run the
-controller on the PC whose mouse/keyboard you want to share, and slide your
-cursor off the screen edge onto the other machine. Scroll Lock toggles /
-force-releases control at any time.
+controller on the PC whose mouse/keyboard you want to share. Then just press
+SCROLL LOCK to send your mouse & keyboard to the other PC, and Scroll Lock
+again to come back. Simple and reliable - no edge-sliding to misfire.
 
 Original clean-room implementation. MIT licensed. Windows.
 
@@ -13,7 +13,7 @@ Usage:
     glide.py receiver                       # the PC being controlled
     glide.py controller --host 192.168.1.42 # the PC you sit at
     glide.py controller                     # will prompt for the receiver IP
-    glide.py --selftest                     # wire-protocol self check
+    glide.py --selftest                     # run the built-in checks
 """
 import argparse
 import ctypes
@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 DEFAULT_PORT = 24800
 
 # ---------------------------------------------------------------------------
@@ -38,6 +38,18 @@ DEFAULT_PORT = 24800
 
 def encode(msg: dict) -> bytes:
     return (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def local_ip() -> str:
+    """Best-guess LAN IP of this machine (no packets actually sent)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return socket.gethostbyname(socket.gethostname())
+    finally:
+        s.close()
 
 
 def iter_messages(sock: socket.socket):
@@ -88,7 +100,10 @@ def run_receiver(port: int):
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", port))
     srv.listen(1)
+    ip = local_ip()
     print(f"Glide receiver {__version__} listening on port {port}.")
+    print(f"On the controller PC, use this IP:  {ip}")
+    print(f"   controller command:  glide.exe controller --host {ip}")
     print("Waiting for a controller to connect... (Ctrl+C to quit)")
     while True:
         conn, addr = srv.accept()
@@ -104,7 +119,7 @@ def run_receiver(port: int):
 
 
 # ---------------------------------------------------------------------------
-# Controller: capture local input, forward it while "remote" is active.
+# Controller: capture local input, forward it while "active" (Scroll Lock on).
 # ---------------------------------------------------------------------------
 
 # Win32 message codes
@@ -122,46 +137,43 @@ BTN_UP = {WM_LBUTTONUP: "left", WM_RBUTTONUP: "right", WM_MBUTTONUP: "middle"}
 
 
 class Controller:
-    def __init__(self, host, port, edge):
+    def __init__(self, host, port):
         self.host = host
         self.port = port
-        self.edge = edge
         self.sock = None
         self.active = False          # True = input is being forwarded
         self.user32 = ctypes.windll.user32
         self.W = self.user32.GetSystemMetrics(0)
         self.H = self.user32.GetSystemMetrics(1)
         self.cx, self.cy = self.W // 2, self.H // 2
-        self.virt = 0.0              # accumulated travel past the edge
-        self.lock = threading.Lock()
 
     # -- networking --------------------------------------------------------
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.host, self.port))
-        print(f"Connected to receiver {self.host}:{self.port}.")
 
     def send(self, msg: dict):
         try:
             self.sock.sendall(encode(msg))
         except OSError as e:
-            print(f"Send failed ({e}); releasing control.")
+            print(f"Send failed ({e}); control back on THIS PC.")
             self.release()
 
     def warp_center(self):
+        # Keep the real cursor pinned to screen center so every physical move
+        # produces a fresh delta we can forward (works on any monitor layout).
         self.user32.SetCursorPos(self.cx, self.cy)
 
-    # -- control handoff ---------------------------------------------------
+    # -- control handoff (Scroll Lock) -------------------------------------
     def grab(self):
         self.active = True
-        self.virt = 0.0
         self.warp_center()
-        print("--> control on RECEIVER (Scroll Lock to return)")
+        print(">>> NOW CONTROLLING THE OTHER PC   (Scroll Lock to come back)")
 
     def release(self):
         if self.active:
             self.active = False
-            print("<-- control back on THIS PC")
+            print("<<< BACK ON THIS PC                (Scroll Lock to switch again)")
 
     def toggle(self):
         self.release() if self.active else self.grab()
@@ -170,29 +182,17 @@ class Controller:
     # pynput suppresses the event when the filter returns False; True/None
     # lets it reach the local machine normally. Keep these fast: they run in
     # the low-level hook thread and Windows unhooks us if we stall.
-    # ponytail: send() does a blocking sendall here; a sender queue if LAN lags.
+    # ponytail: send() blocks on sendall here; add a sender queue if LAN lags.
     def mouse_filter(self):
         def f(msg, data):
-            if msg == WM_MOUSEMOVE:
-                x, y = data.pt.x, data.pt.y
-                if not self.active:
-                    if self._hit_edge(x, y):
-                        self.grab()
-                        return False
-                    return True
-                dx, dy = x - self.cx, y - self.cy
-                if dx == 0 and dy == 0:          # our own re-center echo
-                    return False
-                self.virt += dx                   # track travel to allow return
-                self.send({"t": "mv", "dx": dx, "dy": dy})
-                self.warp_center()
-                if self._return_edge():
-                    self.release()
-                return False
-
             if not self.active:
-                return True
-
+                return True                       # pass everything through locally
+            if msg == WM_MOUSEMOVE:
+                dx, dy = data.pt.x - self.cx, data.pt.y - self.cy
+                if dx or dy:                      # ignore our own re-center echo
+                    self.send({"t": "mv", "dx": dx, "dy": dy})
+                    self.warp_center()
+                return False
             if msg in BTN_DOWN:
                 self.send({"t": "btn", "b": BTN_DOWN[msg], "p": True})
             elif msg in BTN_UP:
@@ -200,52 +200,35 @@ class Controller:
             elif msg in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
                 raw = (data.mouseData >> 16) & 0xFFFF
                 delta = struct.unpack("h", struct.pack("H", raw))[0] // 120
-                if msg == WM_MOUSEWHEEL:
-                    self.send({"t": "scroll", "dx": 0, "dy": delta})
-                else:
-                    self.send({"t": "scroll", "dx": delta, "dy": 0})
+                self.send({"t": "scroll", "dx": 0, "dy": delta} if msg == WM_MOUSEWHEEL
+                          else {"t": "scroll", "dx": delta, "dy": 0})
             return False
         return f
 
     def key_filter(self):
         def f(msg, data):
-            vk = data.vkCode
-            if vk == VK_SCROLL:                   # manual toggle / failsafe
+            if data.vkCode == VK_SCROLL:          # the switch / failsafe
                 if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
                     self.toggle()
                 return False                      # eat both down and up
             if not self.active:
                 return True
             if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                self.send({"t": "key", "vk": vk, "p": True})
+                self.send({"t": "key", "vk": data.vkCode, "p": True})
             elif msg in (WM_KEYUP, WM_SYSKEYUP):
-                self.send({"t": "key", "vk": vk, "p": False})
+                self.send({"t": "key", "vk": data.vkCode, "p": False})
             return False
         return f
-
-    def _hit_edge(self, x, y):
-        if self.edge == "right":
-            return x >= self.W - 1
-        if self.edge == "left":
-            return x <= 0
-        if self.edge == "top":
-            return y <= 0
-        if self.edge == "bottom":
-            return y >= self.H - 1
-        return False
-
-    def _return_edge(self):
-        # Pull the cursor back far enough the other way to hand control back.
-        span = self.W if self.edge in ("left", "right") else self.H
-        if self.edge in ("right", "bottom"):
-            return self.virt <= -span // 2
-        return self.virt >= span // 2
 
     def run(self):
         from pynput import mouse, keyboard
         self.connect()
-        print(f"Glide controller {__version__}. Edge '{self.edge}' -> receiver.")
-        print("Slide the cursor to that edge to cross over. Scroll Lock = manual toggle.")
+        print(f"Glide controller {__version__} connected to {self.host}:{self.port}.")
+        print()
+        print("   Press SCROLL LOCK  ->  your mouse & keyboard drive the OTHER PC")
+        print("   Press SCROLL LOCK  ->  come back to THIS PC")
+        print("   Close this window to quit.")
+        print()
         ml = mouse.Listener(win32_event_filter=self.mouse_filter(), suppress=False)
         kl = keyboard.Listener(win32_event_filter=self.key_filter(), suppress=False)
         ml.start()
@@ -261,10 +244,10 @@ class Controller:
 
 
 # ---------------------------------------------------------------------------
-# Self-test: the wire protocol must survive a round trip (no hooks needed).
+# Built-in checks (no network peer, no real mouse needed).
 # ---------------------------------------------------------------------------
 
-def selftest():
+def wire_test():
     got = []
     a, b = socket.socketpair()
     reader = threading.Thread(target=lambda: got.extend(iter_messages(a)), daemon=True)
@@ -281,7 +264,63 @@ def selftest():
     b.close()
     a.close()
     assert got == sent, f"roundtrip mismatch:\n sent {sent}\n got  {got}"
-    print("selftest OK: 4/4 messages survived the wire round trip.")
+    print("wire test OK: 4/4 messages survived the round trip.")
+
+
+def controller_logic_test():
+    """Feed fake Win32 events through the filters; never touches a real mouse."""
+    class Pt:
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+
+    class MData:
+        def __init__(self, x, y, mouse_data=0):
+            self.pt = Pt(x, y)
+            self.mouseData = mouse_data
+
+    class KData:
+        def __init__(self, vk):
+            self.vkCode = vk
+
+    c = Controller("127.0.0.1", DEFAULT_PORT)
+    c.warp_center = lambda: None          # do NOT move the real cursor
+    c.sent = []
+    c.send = c.sent.append
+    mf, kf = c.mouse_filter(), c.key_filter()
+
+    # inactive: a move passes through locally, nothing is sent
+    assert mf(WM_MOUSEMOVE, MData(c.cx + 9, c.cy)) is True
+    assert c.sent == []
+
+    # Scroll Lock -> active
+    assert kf(WM_KEYDOWN, KData(VK_SCROLL)) is False
+    assert c.active is True
+
+    # active: a move forwards the delta-from-center and is suppressed locally
+    assert mf(WM_MOUSEMOVE, MData(c.cx + 5, c.cy - 3)) is False
+    assert c.sent[-1] == {"t": "mv", "dx": 5, "dy": -3}
+
+    # active: left click and a letter key forward
+    assert mf(WM_LBUTTONDOWN, MData(c.cx, c.cy)) is False
+    assert c.sent[-1] == {"t": "btn", "b": "left", "p": True}
+    assert kf(WM_KEYDOWN, KData(65)) is False
+    assert c.sent[-1] == {"t": "key", "vk": 65, "p": True}
+
+    # Scroll Lock again -> inactive, moves pass through again
+    assert kf(WM_KEYDOWN, KData(VK_SCROLL)) is False
+    assert c.active is False
+    assert mf(WM_MOUSEMOVE, MData(c.cx + 2, c.cy + 2)) is True
+
+    print("controller logic OK: switch, move, click, key, switch-back all correct.")
+
+
+def selftest():
+    wire_test()
+    if sys.platform == "win32":
+        controller_logic_test()
+    else:
+        print("(controller logic test skipped: not on Windows)")
+    print("ALL CHECKS PASSED.")
 
 
 def main():
@@ -289,8 +328,6 @@ def main():
     p.add_argument("role", nargs="?", choices=["receiver", "controller"])
     p.add_argument("--host", help="receiver IP (controller mode)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
-    p.add_argument("--edge", default="right", choices=["left", "right", "top", "bottom"],
-                   help="which screen edge crosses to the receiver")
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args()
 
@@ -318,7 +355,7 @@ def main():
             print("No receiver IP given.")
             sys.exit(1)
         try:
-            Controller(host, args.port, args.edge).run()
+            Controller(host, args.port).run()
         except (ConnectionRefusedError, OSError) as e:
             print(f"Could not reach receiver {host}:{args.port} -> {e}")
             print("Is the receiver running and the port open in the firewall?")

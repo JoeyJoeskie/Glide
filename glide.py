@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.9.3"
+__version__ = "1.0.0"
 DEFAULT_PORT = 24800
 
 # ---------------------------------------------------------------------------
@@ -497,7 +497,6 @@ class Controller:
         return f
 
     def run(self):
-        from pynput import mouse, keyboard
         self.connect()
         print(f"Glide controller {__version__} connected to {self.host}:{self.port}.")
         print(f"   this screen {self.vW}x{self.vH}   |   other screen {self.rw}x{self.rh}")
@@ -506,6 +505,10 @@ class Controller:
         print("   Glide back the other way (or Ctrl+Alt+G)  ->  return to THIS PC")
         print("   Close this window to quit.")
         print()
+        self.run_listeners()
+
+    def run_listeners(self):
+        from pynput import mouse, keyboard
         minner, kinner = self.mouse_filter(), self.key_filter()
 
         def mouse_wf(msg, data):
@@ -625,6 +628,99 @@ def selftest():
     print("ALL CHECKS PASSED.")
 
 
+def run_gui():
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    root = tk.Tk()
+    root.title("Glide")
+    root.resizable(False, False)
+    myip = local_ip()
+
+    tk.Label(root, text="Glide", font=("Segoe UI", 20, "bold")).pack(pady=(14, 0))
+    tk.Label(root, text="one mouse & keyboard, every screen").pack()
+
+    role = tk.StringVar(value="controller")
+    rf = tk.Frame(root)
+    rf.pack(padx=16, pady=10, fill="x")
+    tk.Radiobutton(rf, text="This PC drives the other  (Controller)", variable=role,
+                   value="controller", command=lambda: refresh()).pack(anchor="w")
+    tk.Radiobutton(rf, text="This PC is controlled  (Receiver)", variable=role,
+                   value="receiver", command=lambda: refresh()).pack(anchor="w")
+
+    info = tk.Label(root, text="", fg="#2563eb", font=("Segoe UI", 10, "bold"))
+    info.pack()
+
+    form = tk.Frame(root)
+    form.pack(padx=16, pady=4)
+    tk.Label(form, text="Password:").grid(row=0, column=0, sticky="e", pady=3)
+    pw = tk.Entry(form, show="*", width=24)
+    pw.grid(row=0, column=1, pady=3)
+    host_lbl = tk.Label(form, text="Other PC's IP:")
+    host = tk.Entry(form, width=24)
+    edge_lbl = tk.Label(form, text="Cross at edge:")
+    edge = ttk.Combobox(form, values=["right", "left", "top", "bottom"], width=21, state="readonly")
+    edge.set("right")
+
+    status = tk.Label(root, text="", wraplength=330, justify="left", height=3)
+    status.pack(padx=16, pady=4)
+    start_btn = tk.Button(root, text="Start", width=18, font=("Segoe UI", 11, "bold"))
+    start_btn.pack(pady=(2, 14))
+
+    def refresh():
+        if role.get() == "controller":
+            info.config(text="")
+            host_lbl.grid(row=1, column=0, sticky="e", pady=3)
+            host.grid(row=1, column=1, pady=3)
+            edge_lbl.grid(row=2, column=0, sticky="e", pady=3)
+            edge.grid(row=2, column=1, pady=3)
+        else:
+            info.config(text=f"This PC's IP:  {myip}\n(enter it + the password on the other PC)")
+            for wdg in (host_lbl, host, edge_lbl, edge):
+                wdg.grid_remove()
+
+    def set_status(msg):
+        root.after(0, lambda: status.config(text=msg))
+
+    def start():
+        code = pw.get().strip()
+        if not code:
+            messagebox.showwarning("Glide", "Set a password (the same on both PCs).")
+            return
+        start_btn.config(state="disabled")
+        if role.get() == "receiver":
+            set_status(f"Receiver running on {myip}.\nWaiting for the other PC to connect...")
+            threading.Thread(target=lambda: run_receiver(DEFAULT_PORT, code), daemon=True).start()
+        else:
+            h = host.get().strip()
+            if not h:
+                messagebox.showwarning("Glide", "Enter the other PC's IP address.")
+                start_btn.config(state="normal")
+                return
+            set_status(f"Connecting to {h} ...")
+
+            def go():
+                try:
+                    c = Controller(h, DEFAULT_PORT, edge.get(), code)
+                    c.connect()
+                    set_status(f"Connected  (other screen {c.rw}x{c.rh}).\n"
+                               f"Glide off the {edge.get().upper()} edge to cross over. "
+                               f"Ctrl+Alt+G toggles.")
+                    c.run_listeners()
+                except PermissionError:
+                    set_status("Wrong password - the other PC refused the connection.")
+                    root.after(0, lambda: start_btn.config(state="normal"))
+                except Exception as e:
+                    set_status(f"Could not connect to {h}: {e}")
+                    root.after(0, lambda: start_btn.config(state="normal"))
+
+            threading.Thread(target=go, daemon=True).start()
+
+    start_btn.config(command=start)
+    refresh()
+    root.mainloop()
+
+
 def main():
     p = argparse.ArgumentParser(description="Glide - one mouse & keyboard, every screen.")
     p.add_argument("role", nargs="?", choices=["receiver", "controller"])
@@ -641,9 +737,8 @@ def main():
         return
 
     if args.role is None:
-        print(__doc__)
-        role = input("Run as [receiver/controller]? ").strip().lower()
-        args.role = "controller" if role.startswith("c") else "receiver"
+        run_gui()           # double-click with no arguments -> the point-and-click window
+        return
 
     if sys.platform != "win32" and args.role == "controller":
         print("Controller mode uses Windows low-level hooks; run it on Windows.")

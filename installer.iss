@@ -1,6 +1,6 @@
 ; Glide installer (Inno Setup)
 #define MyAppName "Glide"
-#define MyAppVersion "0.9.3"
+#define MyAppVersion "1.0.0"
 #define MyAppPublisher "Glide (open source)"
 #define MyAppURL "https://github.com/JoeyJoeskie/Glide"
 #define MyAppExeName "glide.exe"
